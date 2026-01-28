@@ -39,8 +39,7 @@ Please include clear commit messages and descriptions for your changes.
 
 ## License
 
-Specify the license you intend to use (e.g., MIT, GPLv3).
-
+MIT
 ---
 
 If you want help drafting a contribution guide or adding examples, I can help with that too.
