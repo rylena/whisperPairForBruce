@@ -10,6 +10,10 @@ var dialogError = dialog.error;
 var serialPrintln = serial.println;
 var fillScreen = display.fill;
 
+// DIY_WhisperPair (Bruce port)
+// BLE scan + "fast pair" style action + optional file playback (if firmware supports it).
+// Use at your own risk.
+
 var CONFIG = {
   SCAN_INTERVAL_MS: 3000,
   MIN_RSSI_DBM: -80,
@@ -76,273 +80,221 @@ function log(msg) {
   serialPrintln(msg);
 }
 
-var WhisperBruceApp = (function () {
-  var _devices = [];
-  var _scanning = false;
+// State (kept global like wifi_brute.js)
+var matched_devices = [];
+var scanning = false;
+var target_device = null;
+var song_to_play_path = "";
 
-  function _matchesFilters(addr, name, rssi) {
-    if (rssi < CONFIG.MIN_RSSI_DBM) {
-      return false;
-    }
+function matchesFilters(addr, name, rssi) {
+  if (rssi < CONFIG.MIN_RSSI_DBM) return false;
+  if (CONFIG.NAME_REGEX && !CONFIG.NAME_REGEX.test(name)) return false;
 
-    if (CONFIG.NAME_REGEX && !CONFIG.NAME_REGEX.test(name)) {
-      return false;
-    }
-
-    if (CONFIG.MAC_PREFIXES && CONFIG.MAC_PREFIXES.length > 0) {
-      var prefixMatch = false;
-      var upper = addr.toUpperCase();
-      for (var i = 0; i < CONFIG.MAC_PREFIXES.length; i++) {
-        var p = CONFIG.MAC_PREFIXES[i];
-        if (upper.indexOf(p) === 0) {
-          prefixMatch = true;
-          break;
-        }
-      }
-      if (!prefixMatch) {
-        return false;
-      }
-    }
-
-    return true;
-  }
-
-  function _findDeviceIndex(addr) {
-    for (var i = 0; i < _devices.length; i++) {
-      if (_devices[i].addr === addr) {
-        return i;
-      }
-    }
-    return -1;
-  }
-
-  function _upsertDevice(addr, name, rssi) {
-    var now = Date.now ? Date.now() : (new Date()).getTime();
-    var idx = _findDeviceIndex(addr);
-
-    if (idx >= 0) {
-      var d = _devices[idx];
-      d.rssi = rssi;
-      d.lastSeen = now;
-      if (d.seenCount < 0x7fffffff) {
-        d.seenCount++;
-      }
-      return;
-    }
-
-    if (_devices.length >= CONFIG.MAX_TRACKED_DEVICES) {
-      var weakestIdx = 0;
-      var weakestRssi = _devices[0].rssi;
-      for (var j = 1; j < _devices.length; j++) {
-        if (_devices[j].rssi < weakestRssi) {
-          weakestRssi = _devices[j].rssi;
-          weakestIdx = j;
-        }
-      }
-      _devices.splice(weakestIdx, 1);
-    }
-
-    _devices.push({
-      addr: addr,
-      name: name,
-      rssi: rssi,
-      lastSeen: now,
-      seenCount: 1
-    });
-  }
-
-  function _onScanDevice(dev) {
-    var addr = dev && dev.addr ? dev.addr : "";
-    var name = dev && dev.name ? dev.name : "";
-    var rssi = dev && typeof dev.rssi === "number" ? dev.rssi : -127;
-
-    if (!addr) {
-      return;
-    }
-
-    if (!_matchesFilters(addr, name, rssi)) {
-      return;
-    }
-
-    _upsertDevice(addr, name, rssi);
-  }
-
-  function _startScanLoop() {
-    if (_scanning) {
-      return;
-    }
-    _scanning = true;
-    _devices.length = 0;
-    BleNative.startScan(_onScanDevice);
-  }
-
-  function _stopScanLoop() {
-    _scanning = false;
-    BleNative.stopScan();
-  }
-
-  function _startScanAndWaitForFirstDevice() {
-    _startScanLoop();
-
-    while (true) {
-      if (_devices.length > 0) {
+  if (CONFIG.MAC_PREFIXES && CONFIG.MAC_PREFIXES.length > 0) {
+    var upper = addr.toUpperCase();
+    var prefixMatch = false;
+    for (var i = 0; i < CONFIG.MAC_PREFIXES.length; i++) {
+      if (upper.indexOf(CONFIG.MAC_PREFIXES[i]) === 0) {
+        prefixMatch = true;
         break;
       }
-      if (keyboard && keyboard.getEscPress && keyboard.getEscPress()) {
-        break;
+    }
+    if (!prefixMatch) return false;
+  }
+
+  return true;
+}
+
+function findDeviceIndex(addr) {
+  for (var i = 0; i < matched_devices.length; i++) {
+    if (matched_devices[i].addr === addr) return i;
+  }
+  return -1;
+}
+
+function upsertDevice(addr, name, rssi) {
+  var now = Date.now ? Date.now() : (new Date()).getTime();
+  var idx = findDeviceIndex(addr);
+
+  if (idx >= 0) {
+    var d = matched_devices[idx];
+    d.rssi = rssi;
+    d.lastSeen = now;
+    if (d.seenCount < 0x7fffffff) d.seenCount++;
+    return;
+  }
+
+  if (matched_devices.length >= CONFIG.MAX_TRACKED_DEVICES) {
+    var weakestIdx = 0;
+    var weakestRssi = matched_devices[0].rssi;
+    for (var j = 1; j < matched_devices.length; j++) {
+      if (matched_devices[j].rssi < weakestRssi) {
+        weakestRssi = matched_devices[j].rssi;
+        weakestIdx = j;
       }
-      if (!_scanning) {
-        break;
-      }
-      delay(100);
     }
-
-    _stopScanLoop();
+    matched_devices.splice(weakestIdx, 1);
   }
 
-  function _getDeviceCount() {
-    return _devices.length;
+  matched_devices.push({
+    addr: addr,
+    name: name,
+    rssi: rssi,
+    lastSeen: now,
+    seenCount: 1
+  });
+}
+
+function onScanDevice(dev) {
+  var addr = dev && dev.addr ? dev.addr : "";
+  var name = dev && dev.name ? dev.name : "";
+  var rssi = dev && typeof dev.rssi === "number" ? dev.rssi : -127;
+  if (!addr) return;
+
+  if (!matchesFilters(addr, name, rssi)) return;
+
+  var wasEmpty = matched_devices.length === 0;
+  upsertDevice(addr, name, rssi);
+
+  // "Select first hit" behavior, like a simple attacker flow.
+  if (wasEmpty && scanning) {
+    target_device = matched_devices[0];
+    stopBleScan();
+  }
+}
+
+function startBleScan() {
+  if (scanning) return;
+  scanning = true;
+  matched_devices = [];
+  target_device = null;
+  BleNative.startScan(onScanDevice);
+}
+
+function stopBleScan() {
+  scanning = false;
+  BleNative.stopScan();
+}
+
+function scanAndPickFirstTarget() {
+  startBleScan();
+  while (true) {
+    if (matched_devices.length > 0) break;
+    if (keyboard && keyboard.getEscPress && keyboard.getEscPress()) break;
+    if (!scanning) break;
+    delay(100); // yield
+  }
+  stopBleScan();
+}
+
+function showMatchedDevices() {
+  fillScreen(0);
+  log("=== Matched Devices (" + matched_devices.length + ") ===");
+
+  if (target_device) {
+    log("TARGET: " + target_device.name + " [" + target_device.addr + "], " + target_device.rssi + " dBm");
   }
 
-  function _playSongOnDeviceByIndex(n, filePath) {
-    if (!filePath) {
-      dialogError("no song selected");
-      return;
-    }
-
-    if (_devices.length === 0) {
-      dialogError("no devices to play on");
-      return;
-    }
-
-    if (!(n > 0 && n <= _devices.length)) {
-      dialogError("invalid device index: " + n);
-      return;
-    }
-
-    var target = _devices[n - 1];
-    log("Playing file on: " + target.name + " [" + target.addr + "]");
-    dialogMessage("Playing on " + target.addr);
-
-    BleNative.playFileOnDevice(target, filePath, function (ok) {
-      if (ok) {
-        dialogMessage("playback OK for " + target.addr, true);
-      } else {
-        dialogError("playback FAILED for " + target.addr, true);
-      }
-    });
+  if (matched_devices.length === 0) {
+    dialogError("no matching devices, start scan first");
+    return;
   }
 
-  function _showDevices() {
-    fillScreen(0);
-    log("=== Matched Devices (" + _devices.length + ") ===");
+  for (var i = 0; i < matched_devices.length; i++) {
+    var d = matched_devices[i];
+    log((i + 1) + ") " + d.name + " [" + d.addr + "], " + d.rssi + " dBm, seen " + d.seenCount + "x");
+  }
+}
 
-    if (_devices.length === 0) {
-      dialogError("no matching devices, start scan first");
-      return;
-    }
-
-    for (var i = 0; i < _devices.length; i++) {
-      var d = _devices[i];
-      log(
-        (i + 1) + ") " +
-        d.name + " [" + d.addr + "], " +
-        d.rssi + " dBm, seen " + d.seenCount + "x"
-      );
-    }
+function triggerActionOnDeviceByIndex(n) {
+  if (matched_devices.length === 0) {
+    dialogError("no devices to act on");
+    return;
+  }
+  if (!(n > 0 && n <= matched_devices.length)) {
+    dialogError("invalid device index: " + n);
+    return;
   }
 
-  function _triggerActionByIndex(n) {
-    if (_devices.length === 0) {
-      dialogError("no devices to act on");
-      return;
-    }
+  var dev = matched_devices[n - 1];
+  target_device = dev;
+  log("Triggering action for: " + dev.name + " [" + dev.addr + "]");
 
-    if (!(n > 0 && n <= _devices.length)) {
-      dialogError("invalid device index: " + n);
-      return;
-    }
+  BleNative.triggerAction(dev, function (ok) {
+    if (ok) dialogMessage("action OK for " + dev.addr, true);
+    else dialogError("action FAILED for " + dev.addr, true);
+  });
+}
 
-    var target = _devices[n - 1];
-    log("Triggering action for: " + target.name + " [" + target.addr + "]");
+function pickSongFile() {
+  var p = dialog.pickFile("/");
+  if (!p) return;
+  song_to_play_path = p;
+}
 
-    BleNative.triggerAction(target, function (ok) {
-      if (ok) {
-        dialogMessage("action OK for " + target.addr, true);
-      } else {
-        dialogError("action FAILED for " + target.addr, true);
-      }
-    });
+function playSongOnTarget() {
+  if (!target_device) {
+    dialogError("no target device, start scan first");
+    return;
+  }
+  if (!song_to_play_path) {
+    dialogError("no song selected");
+    return;
   }
 
-  return {
-    startScan: _startScanLoop,
-    startScanAndWaitForFirstDevice: _startScanAndWaitForFirstDevice,
-    stopScan: _stopScanLoop,
-    showDevices: _showDevices,
-    triggerActionByIndex: _triggerActionByIndex,
-    getDeviceCount: _getDeviceCount,
-    playSongOnDeviceByIndex: _playSongOnDeviceByIndex
-  };
-})();
+  var lower = ("" + song_to_play_path).toLowerCase();
+  if (lower.lastIndexOf(".mp3") !== lower.length - 4) {
+    dialogError("please select an .mp3 file");
+    return;
+  }
 
-var running = true;
-while (running) {
+  log("Playing mp3 on target: " + target_device.name + " [" + target_device.addr + "]");
+  dialogMessage("Playing on " + target_device.addr);
+
+  BleNative.playFileOnDevice(target_device, song_to_play_path, function (ok) {
+    if (ok) dialogMessage("playback OK for " + target_device.addr, true);
+    else dialogError("playback FAILED for " + target_device.addr, true);
+  });
+}
+
+while (true) {
   var choice = dialogChoice({
-    ["Start scan & wait"]: "scan",
-    ["Stop scan"]: "stop",
+    ["Select target (scan)"]: "scan",
     ["Show matched devices"]: "show",
     ["Trigger action"]: "attack",
-    ["Play song on device"]: "play"
+    ["Pick song (.mp3)"]: "pick",
+    ["Play song on target"]: "play"
   });
 
-  if (choice === "") {
-    running = false;
-  } else if (choice === "scan") {
-    dialogMessage("Starting BLE scan..");
-    WhisperBruceApp.startScanAndWaitForFirstDevice();
-    if (WhisperBruceApp.getDeviceCount() > 0) {
-      dialogMessage("device found!", true);
+  if (choice == "") break; // quit
+
+  if (choice == "scan") {
+    dialogMessage("Scanning BLE.. (ESC to stop)");
+    scanAndPickFirstTarget();
+    if (matched_devices.length > 0 && target_device) {
+      dialogMessage("target: " + target_device.addr, true);
     } else {
       dialogMessage("scan stopped, no device", true);
     }
-  } else if (choice === "stop") {
-    WhisperBruceApp.stopScan();
-    dialogMessage("Scan stopped", true);
-  } else if (choice === "show") {
-    WhisperBruceApp.showDevices();
-  } else if (choice === "attack") {
-    var idxStr = dialogChoice({
-      ["Device #1"]: "1",
-      ["Device #2"]: "2",
-      ["Device #3"]: "3",
-      ["Device #4"]: "4",
-      ["Device #5"]: "5"
-    });
-    if (idxStr) {
-      var idx = parseInt(idxStr, 10);
-      WhisperBruceApp.triggerActionByIndex(idx);
-    }
-  } else if (choice === "play") {
-    if (WhisperBruceApp.getDeviceCount() === 0) {
-      dialogError("no devices, start scan first");
+  } else if (choice == "show") {
+    showMatchedDevices();
+  } else if (choice == "attack") {
+    if (matched_devices.length === 0) {
+      dialogError("no devices yet, scan first");
     } else {
-      var playIdxStr = dialogChoice({
+      var idxStr = dialogChoice({
         ["Device #1"]: "1",
         ["Device #2"]: "2",
         ["Device #3"]: "3",
         ["Device #4"]: "4",
         ["Device #5"]: "5"
       });
-
-      if (playIdxStr) {
-        var songPath = dialog.pickFile("/");
-        if (songPath) {
-          var playIdx = parseInt(playIdxStr, 10);
-          WhisperBruceApp.playSongOnDeviceByIndex(playIdx, songPath);
-        }
-      }
+      if (idxStr) triggerActionOnDeviceByIndex(parseInt(idxStr, 10));
     }
+  } else if (choice == "pick") {
+    pickSongFile();
+  } else if (choice == "play") {
+    playSongOnTarget();
   }
 
   fillScreen(0);
