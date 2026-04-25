@@ -1,14 +1,23 @@
-var dialog = require('dialog');
-var serial = require('serial');
-var display = require('display');
-var keyboard = require('keyboard');
+var isNode = typeof process !== "undefined" && process.versions && process.versions.node;
 
-var dialogMessage = dialog.info;
-var dialogChoice = dialog.choice;
-var dialogError = dialog.error;
+var dialog = null;
+var serial = null;
+var display = null;
+var keyboard = null;
 
-var serialPrintln = serial.println;
-var fillScreen = display.fill;
+if (!isNode) {
+  dialog = require("dialog");
+  serial = require("serial");
+  display = require("display");
+  keyboard = require("keyboard");
+}
+
+var dialogMessage = dialog && dialog.info ? dialog.info : function () {};
+var dialogChoice = dialog && dialog.choice ? dialog.choice : function () { return ""; };
+var dialogError = dialog && dialog.error ? dialog.error : function () {};
+
+var serialPrintln = serial && serial.println ? serial.println : function () {};
+var fillScreen = display && display.fill ? display.fill : function () {};
 
 // DIY_WhisperPair (Bruce port)
 // BLE scan + "fast pair" style action + optional file playback (if firmware supports it).
@@ -78,6 +87,34 @@ var BleNative = {
 
 function log(msg) {
   serialPrintln(msg);
+}
+
+function createChoiceMap(pairs) {
+  var choices = {};
+  for (var i = 0; i < pairs.length; i++) {
+    choices[pairs[i][0]] = pairs[i][1];
+  }
+  return choices;
+}
+
+function createMainMenuChoices() {
+  return createChoiceMap([
+    ["Select target (scan)", "scan"],
+    ["Show matched devices", "show"],
+    ["Trigger action", "attack"],
+    ["Pick song (.mp3)", "pick"],
+    ["Play song on target", "play"]
+  ]);
+}
+
+function createDeviceChoices() {
+  return createChoiceMap([
+    ["Device #1", "1"],
+    ["Device #2", "2"],
+    ["Device #3", "3"],
+    ["Device #4", "4"],
+    ["Device #5", "5"]
+  ]);
 }
 
 // State (kept global like wifi_brute.js)
@@ -257,47 +294,49 @@ function playSongOnTarget() {
   });
 }
 
-while (true) {
-  var choice = dialogChoice({
-    ["Select target (scan)"]: "scan",
-    ["Show matched devices"]: "show",
-    ["Trigger action"]: "attack",
-    ["Pick song (.mp3)"]: "pick",
-    ["Play song on target"]: "play"
-  });
+function runApp() {
+  while (true) {
+    var choice = dialogChoice(createMainMenuChoices());
 
-  if (choice == "") break; // quit
+    if (choice == "") break; // quit
 
-  if (choice == "scan") {
-    dialogMessage("Scanning BLE.. (ESC to stop)");
-    scanAndPickFirstTarget();
-    if (matched_devices.length > 0 && target_device) {
-      dialogMessage("target: " + target_device.addr, true);
-    } else {
-      dialogMessage("scan stopped, no device", true);
+    if (choice == "scan") {
+      dialogMessage("Scanning BLE.. (ESC to stop)");
+      scanAndPickFirstTarget();
+      if (matched_devices.length > 0 && target_device) {
+        dialogMessage("target: " + target_device.addr, true);
+      } else {
+        dialogMessage("scan stopped, no device", true);
+      }
+    } else if (choice == "show") {
+      showMatchedDevices();
+    } else if (choice == "attack") {
+      if (matched_devices.length === 0) {
+        dialogError("no devices yet, scan first");
+      } else {
+        var idxStr = dialogChoice(createDeviceChoices());
+        if (idxStr) triggerActionOnDeviceByIndex(parseInt(idxStr, 10));
+      }
+    } else if (choice == "pick") {
+      pickSongFile();
+    } else if (choice == "play") {
+      playSongOnTarget();
     }
-  } else if (choice == "show") {
-    showMatchedDevices();
-  } else if (choice == "attack") {
-    if (matched_devices.length === 0) {
-      dialogError("no devices yet, scan first");
-    } else {
-      var idxStr = dialogChoice({
-        ["Device #1"]: "1",
-        ["Device #2"]: "2",
-        ["Device #3"]: "3",
-        ["Device #4"]: "4",
-        ["Device #5"]: "5"
-      });
-      if (idxStr) triggerActionOnDeviceByIndex(parseInt(idxStr, 10));
-    }
-  } else if (choice == "pick") {
-    pickSongFile();
-  } else if (choice == "play") {
-    playSongOnTarget();
+
+    fillScreen(0);
+    delay(10);
   }
+}
 
-  fillScreen(0);
-  delay(10);
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    createChoiceMap: createChoiceMap,
+    createMainMenuChoices: createMainMenuChoices,
+    createDeviceChoices: createDeviceChoices
+  };
+}
+
+if (!isNode) {
+  runApp();
 }
 
